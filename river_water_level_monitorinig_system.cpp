@@ -6,8 +6,10 @@
 #include <Adafruit_BMP280.h>
 #include <ArduinoJson.h>
 #include <TinyGPSPlus.h>
+#include <math.h>
 
-const char *TB_HOST = "mqtt.____.cloud";
+// ====== SETTINGS ======
+const char *TB_HOST = "";
 const int TB_PORT = ;
 const char *TB_TOKEN = "";
 const char *TB_CLIENT_ID = "ESP8266_RIVER";
@@ -15,18 +17,35 @@ const char *TB_TOPIC = "v1/devices/me/telemetry";
 const char *APN = "";
 const unsigned long TELEMETRY_MS = 10000;
 
+// Turbidity calibration
 const int TURB_ADC_DIRTY = 378;
 const int TURB_ADC_CLEAR = 545;
 const float TURB_NTU_MAX = 3000.0f;
+
+// ====== THRESHOLDS (prototype) ======
+const float ACCEL_MAG_WARN_LO = 9.5f;
+const float ACCEL_MAG_WARN_HI = 11.5f;
+const float ACCEL_MAG_CRIT_LO = 8.0f;
+const float ACCEL_MAG_CRIT_HI = 13.0f;
+const float ACCEL_AXIS_WARN = 10.0f;
+const float ACCEL_AXIS_CRIT = 20.0f;
+const uint8_t ACCEL_ABNORMAL_PERSIST = 3;
+const float TEMP_WARN_C = 35.0f;
+const float TEMP_CRIT_C = 40.0f;
+const float CLARITY_WARN_PCT = 50.0f;
+const float CLARITY_CRIT_PCT = 25.0f;
+const float ALT_WARN_M = 2.0f;
+const float ALT_CRIT_M = 5.0f;
+const uint8_t BASELINE_SAMPLES = 5;
 
 // Pins
 static const uint8_t PIN_SDA = D2;
 static const uint8_t PIN_SCL = D1;
 static const uint8_t PIN_TURBIDITY = A0;
-static const uint8_t PIN_MODEM_RX = D5;  // EC200U TX -> D5
-static const uint8_t PIN_MODEM_TX = D6;  // EC200U RX <- D6
-static const uint8_t PIN_GPS_RX = D7;    // GPS6MV2 TX -> D7
-static const uint8_t PIN_GPS_TX = D8;    // GPS6MV2 RX <- D8 (optional)
+static const uint8_t PIN_MODEM_RX = D5;
+static const uint8_t PIN_MODEM_TX = D6;
+static const uint8_t PIN_GPS_RX = D7;
+static const uint8_t PIN_GPS_TX = D8;
 
 SoftwareSerial modem(PIN_MODEM_RX, PIN_MODEM_TX);
 SoftwareSerial gpsSerial(PIN_GPS_RX, PIN_GPS_TX);
@@ -41,12 +60,18 @@ bool mqttReady = false;
 bool gpsFix = false;
 uint32_t lastTelemetryMs = 0;
 
-double gpsLat = 0;
-double gpsLng = 0;
-double gpsAlt = 0;
-double gpsSpeed = 0;
-uint32_t gpsSatellites = 0;
-uint32_t gpsHdop = 0;
+double gpsLat = 0, gpsLng = 0, gpsAlt = 0, gpsSpeed = 0;
+uint32_t gpsSatellites = 0, gpsHdop = 0;
+
+bool baroBaselineSet = false, gpsBaselineSet = false;
+float baroAltBaseline = 0, gpsAltBaseline = 0;
+uint8_t baroBaseCount = 0, gpsBaseCount = 0;
+float baroBaseSum = 0, gpsBaseSum = 0;
+
+uint8_t accelAbnormalCount = 0;
+bool accelAbnormal = false, accelAbnormalPersistent = false;
+uint8_t alertLevel = 0;
+char alertReason[96];
 
 void clearModem() {
   while (modem.available()) modem.read();
@@ -54,8 +79,7 @@ void clearModem() {
 
 String modemRead(uint32_t ms) {
   String out;
-  uint32_t start = millis();
-  uint32_t lastByte = start;
+  uint32_t start = millis(), lastByte = start;
   while (millis() - start < ms) {
     while (modem.available()) {
       char c = (char)modem.read();
@@ -65,16 +89,14 @@ String modemRead(uint32_t ms) {
     }
     if (out.length() > 0 && (millis() - lastByte) > 250) {
       if (out.indexOf("OK") >= 0 || out.indexOf("ERROR") >= 0 ||
-          out.indexOf("+QMT") >= 0 || out.indexOf("+QI") >= 0) {
-        break;
-      }
+          out.indexOf("+QMT") >= 0 || out.indexOf("+QI") >= 0) break;
     }
     delay(5);
   }
   return out;
 }
 
-String atCmd(const String& cmd, uint32_t waitMs = 1500) {
+String atCmd(const String &cmd, uint32_t waitMs = 1500) {
   modem.listen();
   Serial.println();
   Serial.print(F("AT>> "));
@@ -107,10 +129,7 @@ void serviceGps(uint32_t ms) {
   gpsSerial.listen();
   uint32_t start = millis();
   while (millis() - start < ms) {
-    while (gpsSerial.available()) {
-      char c = (char)gpsSerial.read();
-      gps.encode(c);
-    }
+    while (gpsSerial.available()) gps.encode((char)gpsSerial.read());
     delay(1);
   }
   if (gps.location.isValid()) {
@@ -198,11 +217,13 @@ bool mqttConnect() {
   }
   if (!openOk) {
     mqttReady = false;
+    Serial.println(F("QMTOPEN failed"));
     return false;
   }
 
   delay(400);
-  String connCmd = String("AT+QMTCONN=0,\"") + TB_CLIENT_ID + "\",\"" + TB_TOKEN + "\",\"\"";
+  String connCmd =
+      String("AT+QMTCONN=0,\"") + TB_CLIENT_ID + "\",\"" + TB_TOKEN + "\",\"\"";
   String connResp = atCmd(connCmd, 20000);
   bool connOk = connResp.indexOf("+QMTCONN: 0,0,0") >= 0 ||
                 connResp.indexOf("+QMTCONN:0,0,0") >= 0;
@@ -228,8 +249,11 @@ bool ensureMqtt() {
   return mqttConnect();
 }
 
-bool mqttPublish(const String& payload) {
-  if (!ensureMqtt()) return false;
+bool mqttPublish(const String &payload) {
+  if (!ensureMqtt()) {
+    Serial.println(F("Publish skipped: MQTT not ready"));
+    return false;
+  }
   clearModem();
   delay(50);
   String pubCmd = String("AT+QMTPUBEX=0,0,0,0,\"") + TB_TOPIC + "\"," +
@@ -242,6 +266,7 @@ bool mqttPublish(const String& payload) {
   modem.print("\r\n");
 
   if (!waitForPrompt(8000)) {
+    Serial.println(F("No '>' - reconnect"));
     modemRead(500);
     mqttReady = false;
     if (!ensureMqtt()) return false;
@@ -254,8 +279,7 @@ bool mqttPublish(const String& payload) {
       return false;
     }
   }
-
-  modem.print(payload);  // no Ctrl+Z for QMTPUBEX
+  modem.print(payload);
   String pubResp = modemRead(12000);
   bool ok = pubResp.indexOf("+QMTPUBEX: 0,0,0") >= 0 ||
             pubResp.indexOf("+QMTPUBEX:0,0,0") >= 0;
@@ -280,10 +304,94 @@ float clarityFromNtu(float ntu) {
   return c;
 }
 
-void readSensors(float& ax, float& ay, float& az,
-                 float& tempC, float& hPa, float& altM,
-                 int& turbRaw, float& turbV, float& ntu, float& clarity) {
-  ax = ay = az = 0;
+void updateBaselines(float baroAlt) {
+  if (!baroBaselineSet && bmpOk && baroAlt > 0.0f) {
+    baroBaseSum += baroAlt;
+    baroBaseCount++;
+    if (baroBaseCount >= BASELINE_SAMPLES) {
+      baroAltBaseline = baroBaseSum / (float)baroBaseCount;
+      baroBaselineSet = true;
+      Serial.print(F("Baro baseline: "));
+      Serial.println(baroAltBaseline, 2);
+    }
+  }
+  if (!gpsBaselineSet && gpsFix && gps.altitude.isValid()) {
+    gpsBaseSum += (float)gpsAlt;
+    gpsBaseCount++;
+    if (gpsBaseCount >= BASELINE_SAMPLES) {
+      gpsAltBaseline = gpsBaseSum / (float)gpsBaseCount;
+      gpsBaselineSet = true;
+      Serial.print(F("GPS alt baseline: "));
+      Serial.println(gpsAltBaseline, 2);
+    }
+  }
+}
+
+void evaluateThresholds(float ax, float ay, float az, float mag, float tempC,
+                        float baroAlt, float clarity) {
+  alertLevel = 0;
+  alertReason[0] = '\0';
+
+  auto raise = [](uint8_t level, const char *reason) {
+    if (level > alertLevel) {
+      alertLevel = level;
+      strncpy(alertReason, reason, sizeof(alertReason) - 1);
+      alertReason[sizeof(alertReason) - 1] = '\0';
+    }
+  };
+
+  if (accelOk) {
+    float absx = fabsf(ax), absy = fabsf(ay), absz = fabsf(az);
+    if (absx > ACCEL_AXIS_CRIT || absy > ACCEL_AXIS_CRIT || absz > ACCEL_AXIS_CRIT)
+      raise(2, "accel_axis_critical");
+    else if (absx > ACCEL_AXIS_WARN || absy > ACCEL_AXIS_WARN || absz > ACCEL_AXIS_WARN)
+      raise(1, "accel_axis_warning");
+
+    if (mag < ACCEL_MAG_CRIT_LO || mag > ACCEL_MAG_CRIT_HI) {
+      raise(2, "accel_magnitude_critical");
+      accelAbnormal = true;
+    } else if (mag < ACCEL_MAG_WARN_LO || mag > ACCEL_MAG_WARN_HI) {
+      raise(1, "accel_magnitude_warning");
+      accelAbnormal = true;
+    } else {
+      accelAbnormal = false;
+    }
+
+    if (accelAbnormal) {
+      if (accelAbnormalCount < 255) accelAbnormalCount++;
+    } else {
+      accelAbnormalCount = 0;
+    }
+    accelAbnormalPersistent = (accelAbnormalCount >= ACCEL_ABNORMAL_PERSIST);
+    if (accelAbnormalPersistent) raise(2, "accel_abnormal_persistent");
+    else if (accelAbnormal) raise(1, "accel_abnormal");
+  }
+
+  if (bmpOk) {
+    if (tempC > TEMP_CRIT_C) raise(2, "temp_critical");
+    else if (tempC > TEMP_WARN_C) raise(1, "temp_warning");
+  }
+
+  if (clarity < CLARITY_CRIT_PCT) raise(2, "clarity_critical");
+  else if (clarity < CLARITY_WARN_PCT) raise(1, "clarity_warning");
+
+  if (bmpOk && baroBaselineSet) {
+    float d = fabsf(baroAlt - baroAltBaseline);
+    if (d > ALT_CRIT_M) raise(2, "baro_altitude_critical");
+    else if (d > ALT_WARN_M) raise(1, "baro_altitude_warning");
+  }
+
+  if (gpsFix && gpsBaselineSet) {
+    float d = fabsf((float)gpsAlt - gpsAltBaseline);
+    if (d > ALT_CRIT_M) raise(2, "gps_altitude_critical");
+    else if (d > ALT_WARN_M) raise(1, "gps_altitude_warning");
+  }
+}
+
+void readSensors(float &ax, float &ay, float &az, float &mag, float &tempC,
+                 float &hPa, float &altM, int &turbRaw, float &turbV,
+                 float &ntu, float &clarity) {
+  ax = ay = az = mag = 0;
   tempC = hPa = altM = 0;
   ntu = clarity = 0;
 
@@ -293,6 +401,7 @@ void readSensors(float& ax, float& ay, float& az,
     ax = e.acceleration.x;
     ay = e.acceleration.y;
     az = e.acceleration.z;
+    mag = sqrtf(ax * ax + ay * ay + az * az);
   }
   if (bmpOk) {
     tempC = bmp.readTemperature();
@@ -311,36 +420,61 @@ void readSensors(float& ax, float& ay, float& az,
   clarity = clarityFromNtu(ntu);
 }
 
-String buildJson(float ax, float ay, float az,
-                 float tempC, float hPa, float altM,
-                 int turbRaw, float turbV, float ntu, float clarity) {
+String buildJson(float ax, float ay, float az, float mag, float tempC,
+                 float hPa, float altM, int turbRaw, float turbV, float ntu,
+                 float clarity) {
   JsonDocument doc;
+
   if (accelOk) {
     doc["accel_x"] = serialized(String(ax, 2));
     doc["accel_y"] = serialized(String(ay, 2));
     doc["accel_z"] = serialized(String(az, 2));
+    doc["accel_magnitude"] = serialized(String(mag, 2));
+    doc["accel_abnormal"] = accelAbnormal;
+    doc["accel_abnormal_persistent"] = accelAbnormalPersistent;
   }
   if (bmpOk) {
     doc["temp"] = serialized(String(tempC, 2));
     doc["pressure_hpa"] = serialized(String(hPa, 2));
     doc["baro_altitude"] = serialized(String(altM, 2));
+    if (baroBaselineSet) {
+      doc["baro_altitude_baseline"] = serialized(String(baroAltBaseline, 2));
+      doc["baro_altitude_delta"] = serialized(String(altM - baroAltBaseline, 2));
+    }
   }
+
   doc["turbidity_raw"] = turbRaw;
   doc["turbidity_v"] = serialized(String(turbV, 3));
   doc["turbidity_ntu"] = serialized(String(ntu, 1));
   doc["clarity_percent"] = serialized(String(clarity, 1));
   doc["water_clarity"] = serialized(String(clarity, 1));
 
-  // GPS6MV2
   doc["gps_fix"] = gpsFix;
   if (gpsFix) {
     doc["latitude"] = serialized(String(gpsLat, 6));
     doc["longitude"] = serialized(String(gpsLng, 6));
     doc["gps_altitude"] = serialized(String(gpsAlt, 1));
+    doc["gps_altitude_m"] = serialized(String(gpsAlt, 1));
     doc["gps_speed_kmh"] = serialized(String(gpsSpeed, 1));
+    if (gpsBaselineSet) {
+      doc["gps_altitude_baseline"] = serialized(String(gpsAltBaseline, 2));
+      doc["gps_altitude_delta"] =
+          serialized(String((float)gpsAlt - gpsAltBaseline, 2));
+    }
   }
   doc["gps_satellites"] = gpsSatellites;
   doc["gps_hdop"] = gpsHdop;
+
+  doc["alert_level"] = alertLevel;
+  doc["alert_status"] = (alertLevel == 0) ? "OK" : (alertLevel == 1) ? "WARNING" : "CRITICAL";
+  if (alertReason[0]) doc["alert_reason"] = alertReason;
+
+  doc["th_temp_warn"] = TEMP_WARN_C;
+  doc["th_temp_crit"] = TEMP_CRIT_C;
+  doc["th_clarity_warn"] = CLARITY_WARN_PCT;
+  doc["th_clarity_crit"] = CLARITY_CRIT_PCT;
+  doc["th_alt_warn_m"] = ALT_WARN_M;
+  doc["th_alt_crit_m"] = ALT_CRIT_M;
 
   String payload;
   serializeJson(doc, payload);
@@ -350,14 +484,14 @@ String buildJson(float ax, float ay, float az,
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println(F("River monitor + GPS6MV2"));
+  Serial.println();
+  Serial.println(F("River monitor + thresholds + GPS + MQTT"));
 
   Wire.begin(PIN_SDA, PIN_SCL);
   delay(50);
 
   gpsSerial.begin(9600);
-  gpsSerial.listen();
-  Serial.println(F("GPS serial 9600 on D7 (TX from module)"));
+  Serial.println(F("GPS on D7 @ 9600"));
 
   accelOk = accel.begin();
   if (accelOk) {
@@ -385,26 +519,23 @@ void setup() {
 }
 
 void loop() {
-  // Collect GPS NMEA between modem bursts
   serviceGps(800);
 
-  float ax, ay, az, tempC, hPa, altM, turbV, ntu, clarity;
+  float ax, ay, az, mag, tempC, hPa, altM, turbV, ntu, clarity;
   int turbRaw;
-  readSensors(ax, ay, az, tempC, hPa, altM, turbRaw, turbV, ntu, clarity);
-  String json = buildJson(ax, ay, az, tempC, hPa, altM, turbRaw, turbV, ntu, clarity);
+  readSensors(ax, ay, az, mag, tempC, hPa, altM, turbRaw, turbV, ntu, clarity);
+  updateBaselines(altM);
+  evaluateThresholds(ax, ay, az, mag, tempC, altM, clarity);
+  String json = buildJson(ax, ay, az, mag, tempC, hPa, altM, turbRaw, turbV, ntu, clarity);
 
   static uint32_t lastPrint = 0;
   if (millis() - lastPrint >= 2000) {
     lastPrint = millis();
-    Serial.print(F("GPS fix="));
-    Serial.print(gpsFix ? F("YES") : F("NO"));
-    Serial.print(F(" sat="));
-    Serial.print(gpsSatellites);
-    if (gpsFix) {
-      Serial.print(F(" lat="));
-      Serial.print(gpsLat, 6);
-      Serial.print(F(" lng="));
-      Serial.print(gpsLng, 6);
+    Serial.print(F("ALERT="));
+    Serial.print(alertLevel == 0 ? F("OK") : alertLevel == 1 ? F("WARNING") : F("CRITICAL"));
+    if (alertReason[0]) {
+      Serial.print(F(" reason="));
+      Serial.print(alertReason);
     }
     Serial.println();
     Serial.print(F("JSON: "));
